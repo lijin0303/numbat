@@ -1,0 +1,184 @@
+import pandas as pd
+
+# Define the default configuration parameters
+default_config = {                                  
+    "gmap": "/Eagle_v2.4.1/tables/genetic_map_hg38_withX.txt.gz",     # Genetic map file path
+    "snpvcf": "/data/genome1K.phase3.SNP_AF5e2.chr1toX.hg38.vcf",       # SNP VCF file path
+    "paneldir": "/data/1000G_hg38",                                     # Directory for 1000 Genomes panel files
+    "bin_genomicranges": "/build/bin_data/var220k.rds",                # RDS file for genomic ranges
+    "parL": "/build/bin_data/par_comb_bincnt.rds",                      # RDS file for parallel combination counts
+    "atac_umitag": "None",                                              # ATAC UMI tag (default: None)
+    "rna_umitag": "Auto",                                               # RNA UMI tag (default: Auto)
+    "gtf": "hg38"                                                       # Genome annotation version identifier
+}
+
+# (user values override defaults)
+config = {**default_config, **config}     
+
+globals().update(config)
+
+SAMPLES = pd.read_csv(samples_file, comment = '#')
+
+def chroms(filepath, suffix):
+	return [filepath + '_chr' + str(i) + suffix for i in range(1,23)]
+
+def outname_rna_binned_genomic_regions(bin_genomicranges, suff):
+	"""
+	returns the output filename of the binned gene to binned genome
+	"""
+	return bin_genomicranges[:-len('.rds')] + '_geneBinMap' + suff
+
+def getbackground(wildcards):
+	row = SAMPLES.loc[(SAMPLES["sample_name"] == wildcards.sample)]
+	return row["background"].iloc[0]
+
+def getassay(wildcards): 
+	return atac_umitag if wildcards.assay == 'atac' else rna_umitag
+
+
+gene_bin = outname_rna_binned_genomic_regions(config['bin_genomicranges'], '.csv')
+
+
+rule all:
+	input:
+		gene_bin,
+		expand("data/{sample}_{assay}_barcodes.txt", sample = SAMPLES['sample_name'], assay = ['rna', 'atac']),
+		expand("data/{sample}_seurat_object_filtered.rds", sample = SAMPLES['sample_name']),
+		expand("data/{sample}_atac_fragments.tsv.gz", sample = SAMPLES['sample_name']),
+
+		expand('{sample}/atac/{sample}_binned_atac.tsv', sample = SAMPLES['sample_name']),
+		expand('{sample}/rna/{sample}_binned_rna.rds', sample = SAMPLES['sample_name']),
+
+		expand('{sample}/{assay}/{sample}_allele_counts.tsv.gz', sample = SAMPLES['sample_name'], assay = ['rna', 'atac']),
+		expand('{sample}/{sample}_paired_allele_counts.tsv.gz', sample = SAMPLES['sample_name']),
+		expand('{sample}/{sample}_paired_binned_counts.rds', sample = SAMPLES['sample_name']),
+
+		expand('{sample}/paired/bulk_clones_final.png', sample = SAMPLES['sample_name'])
+
+
+rule gene_to_bin_map:
+	output:
+		gene_bin
+	run:
+		shell(
+		'''
+		Rscript /build/scripts/get_gene_binned_intersections.R \
+		  --numbatGTFname {gtf} \
+		  --binGR {bin_genomicranges} \
+		  --outfile {output}
+		''')
+
+
+rule get_atac_count_matrix:
+	input:
+		barcodes="data/{sample}_atac_barcodes.txt",
+		frag="data/{sample}_atac_fragments.tsv.gz"
+	output:
+		'{sample}/atac/{sample}_binned_atac.tsv'
+	run:
+		shell(
+		'''
+		Rscript /build/scripts/get_binned_atac.R  \
+		  --CB {input.barcodes}  \
+		  --frag {input.frag} \
+		  --outFile {output}  \
+		  --binGR {bin_genomicranges}
+		''')
+
+
+rule get_rna_count_matrix:
+	input:
+		barcodes="data/{sample}_rna_barcodes.txt",
+		seurat_file="data/{sample}_seurat_object_filtered.rds",
+		gene_bin_input=gene_bin
+	output:
+		'{sample}/rna/{sample}_binned_rna.rds'
+	run:
+		shell(
+		'''
+		Rscript /build/scripts/get_binned_rna.R \
+			--rnaCountsFile {input.seurat_file} \
+			--geneBinMapCSVFile {input.gene_bin_input} \
+			--outFile {output} --barcodesKeep {input.barcodes}
+		''')
+
+
+rule prep_paired_data:
+	input:
+		ac_rna = '{sample}/rna/{sample}_allele_counts.tsv.gz',
+		ac_atac = '{sample}/atac/{sample}_allele_counts.tsv.gz',
+		count_rna = '{sample}/rna/{sample}_binned_rna.rds',
+		count_atac = '{sample}/atac/{sample}_binned_atac.tsv'
+		
+	output:
+		ac = '{sample}/{sample}_paired_allele_counts.tsv.gz',
+		counts = '{sample}/{sample}_paired_binned_counts.rds'
+	run:
+		shell(
+		'''
+		Rscript /build/scripts/scpaired_data_prep.R \
+			--alleleCounts_RNA {input.ac_rna} \
+			--alleleCounts_ATAC {input.ac_atac} \
+			--outAlleleCountsFile {output.ac} \
+			--binCounts_RNA {input.count_rna} \
+			--binCounts_ATAC {input.count_atac} \
+			--outBinCountsFile {output.counts} \
+			--runMultiomeAsPaired
+		''')
+
+
+rule run_numbat_multiome:
+	input:
+		ac = '{sample}/{sample}_paired_allele_counts.tsv.gz',
+		counts = '{sample}/{sample}_paired_binned_counts.rds'
+	output:
+		'{sample}/paired/bulk_clones_final.png'
+	params:
+		background=getbackground
+	run:
+		shell(
+		'''
+		Rscript /build/scripts/run_numbat_multiome.R  \
+			--countmat {input.counts} \
+			--alleledf {input.ac} \
+			--out_dir {wildcards.sample}/paired/ \
+			--ref {params.background} \
+			--gtf {bin_genomicranges} \
+			--parL {parL}
+		''')
+
+#####################################################################################
+# Pileup and Phasing rules
+#####################################################################################
+
+
+rule phase_pileup:
+	input:
+		bam = "data/{sample}_{assay}_possorted_bam.bam",
+		barcodes = "data/{sample}_{assay}_barcodes.txt",
+	output:
+		'{sample}/{assay}/{sample}_allele_counts.tsv.gz'
+	params:
+		umitag = getassay
+	threads:
+		12
+	run:
+		shell(
+		'''
+		sed -E "s/^(([ACGT]{{16}}-1)).*/\\1/" {input.barcodes} \
+			> validated_barcodes_{wildcards.assay}.txt
+		Rscript /build/scripts/pileup_and_phase.R \
+			--outdir {wildcards.sample}/{wildcards.assay} \
+			--label {wildcards.sample} \
+			--samples {wildcards.sample} \
+			--bams {input.bam} \
+			--gmap {gmap} \
+			--snpvcf {snpvcf} \
+			--paneldir {paneldir} \
+			--cellTAG CB \
+			--ncores {threads} \
+			--barcodes validated_barcodes_{wildcards.assay}.txt \
+			--UMItag {params.umitag} 
+		rm validated_barcodes_{wildcards.assay}.txt
+		''')
+
